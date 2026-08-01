@@ -67,3 +67,29 @@ npm run build
 npm run app:check
 npm run server:check
 ```
+
+## Contabo deployment with Docker
+
+The Compose setup runs the website and API. Both services read the existing `.env` file. MongoDB, Keycloak, and R2 continue using the addresses and credentials already configured there.
+
+After cloning the repository on the server:
+
+```bash
+cp .env.example .env
+nano .env
+docker compose build
+docker compose up -d
+docker compose ps
+```
+
+For production, set `NEXT_PUBLIC_API_URL`, `WEB_ORIGINS`, and the existing service credentials in `.env`. The `MONGODB_URI` address must be reachable from inside the API container.
+
+To deploy a later GitHub update:
+
+```bash
+git pull origin main
+docker compose build
+docker compose up -d
+```
+
+View service output with `docker compose logs -f web api`.
