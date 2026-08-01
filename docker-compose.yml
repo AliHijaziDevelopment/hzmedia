@@ -6,7 +6,7 @@ services:
     env_file:
       - ./.env
     ports:
-      - "${API_PORT:-4000}:4000"
+      - "127.0.0.1:4001:4000"
     restart: unless-stopped
 
   web:
@@ -20,7 +20,7 @@ services:
     environment:
       PORT: 3000
     ports:
-      - "${WEB_PORT:-3000}:3000"
+      - "127.0.0.1:${WEB_PORT:-3000}:3000"
     depends_on:
       - api
     restart: unless-stopped
