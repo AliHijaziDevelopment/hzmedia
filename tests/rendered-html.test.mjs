@@ -27,24 +27,32 @@ test("server-renders the HZ Media application shell", async () => {
   assert.doesNotMatch(html, /Your site is taking shape|Building your site/);
 });
 
-test("keeps live upload progress and album downloads connected", async () => {
-  const [dashboard, server, archive, styles] = await Promise.all([
+test("keeps live progress and backend-mediated media transfers connected", async () => {
+  const [dashboard, server, styles, nginx] = await Promise.all([
     readFile(new URL("../app/dashboard.tsx", import.meta.url), "utf8"),
     readFile(new URL("../server/index.ts", import.meta.url), "utf8"),
-    readFile(new URL("../server/zip-stream.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../deploy/nginx-hzmedia.conf", import.meta.url), "utf8"),
   ]);
 
   assert.match(dashboard, /new WebSocket\(url\)/);
   assert.match(dashboard, /new XMLHttpRequest\(\)/);
   assert.match(dashboard, /request\.upload\.onprogress/);
+  assert.match(dashboard, /request\.withCredentials = true/);
+  assert.match(dashboard, /X-HZ-Media-Request/);
+  assert.match(dashboard, /\/api\/albums\/\$\{album\._id\}\/uploads/);
+  assert.doesNotMatch(dashboard, /cloudflarestorage|presign/i);
   assert.match(dashboard, /<UploadTray/);
-  assert.match(dashboard, /\/api\/albums\/\$\{album\._id\}\/download/);
+  assert.match(dashboard, /href=\{item\.downloadUrl\}/);
   assert.match(server, /httpServer\.on\("upgrade"/);
-  assert.match(server, /app\.get\("\/api\/albums\/:albumId\/download"/);
-  assert.match(server, /streamAlbumZip/);
-  assert.match(archive, /Content-Disposition/);
-  assert.match(archive, /GetObjectCommand/);
+  assert.match(server, /Body: request/);
+  assert.match(server, /\/api\/media\/:mediaId\/content/);
+  assert.match(server, /await pipeline/);
+  assert.match(server, /downloadUrl/);
+  assert.doesNotMatch(server, /getSignedUrl|uploadUrl/);
+  assert.doesNotMatch(server, /streamAlbumZip/);
+  assert.match(nginx, /client_max_body_size 512m/);
+  assert.match(nginx, /proxy_request_buffering off/);
   assert.match(styles, /\.upload-tray/);
-  assert.match(styles, /\.album-download/);
+  assert.match(styles, /\.media-download/);
 });

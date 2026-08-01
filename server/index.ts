@@ -1,6 +1,8 @@
 import crypto from "node:crypto";
 import { createServer, ServerResponse as NodeServerResponse } from "node:http";
 import { createRequire } from "node:module";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import express, { type NextFunction, type Request, type Response } from "express";
 import cors from "cors";
 import helmet from "helmet";
@@ -9,13 +11,11 @@ import session from "express-session";
 import MongoStore from "connect-mongo";
 import mongoose from "mongoose";
 import { DeleteObjectCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
-import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { z } from "zod";
 import { allowedOrigins, env } from "./config.js";
 import { getKeycloakAccessToken, getSession, login, logout, requireAuth, requireSuperAdmin, sessionCookieOptions } from "./auth.js";
 import { createKeycloakUser, deleteKeycloakUser, KeycloakAdminError } from "./keycloak-admin.js";
 import { Activity, Album, Company, Media, User } from "./models.js";
-import { streamAlbumZip } from "./zip-stream.js";
 
 const { WebSocketServer } = createRequire(import.meta.url)("ws") as { WebSocketServer: new (options: { noServer: boolean }) => any };
 const liveClients = new Map<string, Set<any>>();
@@ -63,6 +63,20 @@ async function canAccessCompany(request: Request, companyId: string) {
   if (request.auth?.isSuperAdmin) return true;
   const user = await currentUser(request);
   return user.companyIds.some((id: mongoose.Types.ObjectId) => id.equals(companyId));
+}
+
+function mediaDisposition(disposition: "inline" | "attachment", filename: string) {
+  const fallback = filename.normalize("NFKC").replace(/[^\x20-\x7e]|["\\]/g, "_").replace(/[\r\n]/g, "_").slice(0, 180) || "media";
+  const encoded = encodeURIComponent(filename).replace(/[!'()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encoded}`;
+}
+
+async function accessibleMedia(request: Request, response: Response) {
+  const mediaId = objectId.parse(request.params.mediaId);
+  const media = await Media.findOne({ _id: mediaId, status: "ready" });
+  if (!media) { response.status(404).json({ error: "Media not found" }); return null; }
+  if (!await canAccessCompany(request, String(media.companyId))) { response.status(403).json({ error: "Media access denied" }); return null; }
+  return media;
 }
 
 async function recordActivity(actor: Awaited<ReturnType<typeof currentUser>>, entry: { companyId?: string | mongoose.Types.ObjectId; action: "company.created" | "user.created" | "user.assigned" | "album.created" | "media.uploaded"; targetType: "company" | "user" | "album" | "media"; targetId: string | mongoose.Types.ObjectId; targetName: string; detail: string }) {
@@ -221,65 +235,74 @@ app.get("/api/albums/:albumId/media", asyncRoute(async (request, response) => {
   if (!album) return response.status(404).json({ error: "Album not found" });
   if (!await canAccessCompany(request, String(album.companyId))) return response.status(403).json({ error: "Album access denied" });
   const media = await Media.find({ albumId, status: "ready" }).sort({ createdAt: -1 }).lean();
-  const withPrivateUrls = await Promise.all(media.map(async (item) => ({
-    ...item,
-    url: await getSignedUrl(r2, new GetObjectCommand({
-      Bucket: env.R2_BUCKET,
-      Key: item.objectKey,
-      ResponseContentDisposition: `inline; filename*=UTF-8''${encodeURIComponent(item.filename)}`,
-      ResponseContentType: item.mimeType,
-    }), { expiresIn: 900 }),
-    urlExpiresIn: 900,
-  })));
-  response.set("Cache-Control", "private, no-store").json({ media: withPrivateUrls });
-}));
-
-app.get("/api/albums/:albumId/download", rateLimit({ windowMs: 60 * 60_000, limit: 10, standardHeaders: "draft-7", legacyHeaders: false }), asyncRoute(async (request, response) => {
-  const albumId = objectId.parse(request.params.albumId);
-  const album = await Album.findById(albumId).select("companyId name").lean();
-  if (!album) return response.status(404).json({ error: "Album not found" });
-  if (!await canAccessCompany(request, String(album.companyId))) return response.status(403).json({ error: "Album access denied" });
-  const files = await Media.find({ albumId, status: "ready" }).select("objectKey filename bytes updatedAt").sort({ createdAt: 1 }).lean();
-  await streamAlbumZip(response, r2, env.R2_BUCKET, files, album.name);
+  response.set("Cache-Control", "private, no-store").json({ media: media.map((item) => ({
+    _id: item._id,
+    filename: item.filename,
+    mimeType: item.mimeType,
+    kind: item.kind,
+    bytes: item.bytes,
+    url: `/api/media/${item._id}/content`,
+    downloadUrl: `/api/media/${item._id}/content?download=1`,
+  })) });
 }));
 
 app.post("/api/albums/:albumId/uploads", rateLimit({ windowMs: 60_000, limit: 30 }), asyncRoute(async (request, response) => {
   const albumId = objectId.parse(request.params.albumId);
-  const input = z.object({ filename: z.string().trim().min(1).max(180), mimeType: z.string().regex(/^(image|video)\/[a-z0-9.+-]+$/i), bytes: z.number().int().positive().max(500 * 1024 * 1024) }).parse(request.body);
+  const input = z.object({
+    filename: z.string().trim().min(1).max(180),
+    mimeType: z.string().regex(/^(image|video)\/[a-z0-9.+-]+$/i),
+    bytes: z.coerce.number().int().positive().max(500 * 1024 * 1024),
+    uploadId: z.string().trim().min(1).max(80),
+  }).parse(request.query);
+  if (request.get("Content-Type")?.toLowerCase() !== input.mimeType.toLowerCase()) return response.status(400).json({ error: "Media type does not match the upload" });
+  if (Number(request.get("Content-Length")) !== input.bytes) return response.status(400).json({ error: "File size does not match the upload" });
   const album = await Album.findById(albumId).lean();
   if (!album) return response.status(404).json({ error: "Album not found" });
   if (!await canAccessCompany(request, String(album.companyId))) return response.status(403).json({ error: "Album access denied" });
   const user = await currentUser(request);
   const extension = input.filename.split(".").pop()?.replace(/[^a-z0-9]/gi, "").slice(0, 8) || "bin";
   const objectKey = `${album.companyId}/${albumId}/${crypto.randomUUID()}.${extension}`;
-  const media = await Media.create({ companyId: album.companyId, albumId, uploadedBy: user._id, objectKey, filename: input.filename, mimeType: input.mimeType, bytes: input.bytes, kind: input.mimeType.startsWith("image/") ? "image" : "video" });
-  const uploadUrl = await getSignedUrl(r2, new PutObjectCommand({ Bucket: env.R2_BUCKET, Key: objectKey, ContentType: input.mimeType }), { expiresIn: 300 });
-  response.status(201).json({ mediaId: media.id, uploadUrl, expiresIn: 300 });
+  await r2.send(new PutObjectCommand({ Bucket: env.R2_BUCKET, Key: objectKey, Body: request, ContentLength: input.bytes, ContentType: input.mimeType }));
+  try {
+    const media = await Media.create({ companyId: album.companyId, albumId, uploadedBy: user._id, objectKey, filename: input.filename, mimeType: input.mimeType, bytes: input.bytes, kind: input.mimeType.startsWith("image/") ? "image" : "video", status: "ready" });
+    await recordActivity(user, { companyId: media.companyId, action: "media.uploaded", targetType: "media", targetId: media._id, targetName: media.filename, detail: `Uploaded ${media.filename}` });
+    emitToUser(request.auth!.subject, { type: "upload:complete", uploadId: input.uploadId, mediaId: media.id, filename: media.filename, progress: 100 });
+    response.status(201).json({ mediaId: media.id });
+  } catch (error) {
+    await r2.send(new DeleteObjectCommand({ Bucket: env.R2_BUCKET, Key: objectKey })).catch(() => undefined);
+    throw error;
+  }
 }));
 
-app.post("/api/media/:mediaId/complete", asyncRoute(async (request, response) => {
-  const mediaId = objectId.parse(request.params.mediaId);
-  const input = z.object({ uploadId: z.string().trim().min(1).max(80).optional() }).parse(request.body ?? {});
-  const media = await Media.findById(mediaId);
-  if (!media) return response.status(404).json({ error: "Media not found" });
-  if (!await canAccessCompany(request, String(media.companyId))) return response.status(403).json({ error: "Media access denied" });
-  const uploaded = await r2.send(new HeadObjectCommand({ Bucket: env.R2_BUCKET, Key: media.objectKey }));
-  const hasExpectedSize = uploaded.ContentLength === media.bytes;
-  const hasExpectedType = uploaded.ContentType?.toLowerCase() === media.mimeType.toLowerCase();
-  if (!hasExpectedSize || !hasExpectedType) {
-    await r2.send(new DeleteObjectCommand({ Bucket: env.R2_BUCKET, Key: media.objectKey }));
-    await media.deleteOne();
-    return response.status(400).json({ error: "Uploaded file did not match the requested size or media type" });
-  }
-  const wasReady = media.status === "ready";
-  media.status = "ready";
-  await media.save();
-  if (!wasReady) {
-    const actor = await currentUser(request);
-    await recordActivity(actor, { companyId: media.companyId, action: "media.uploaded", targetType: "media", targetId: media._id, targetName: media.filename, detail: `Uploaded ${media.filename}` });
-  }
-  emitToUser(request.auth!.subject, { type: "upload:complete", uploadId: input.uploadId, mediaId: media.id, filename: media.filename, progress: 100 });
-  response.json({ media });
+app.head("/api/media/:mediaId/content", asyncRoute(async (request, response) => {
+  const media = await accessibleMedia(request, response);
+  if (!media) return;
+  const object = await r2.send(new HeadObjectCommand({ Bucket: env.R2_BUCKET, Key: media.objectKey }));
+  response.setHeader("Content-Type", media.mimeType);
+  response.setHeader("Content-Disposition", mediaDisposition(request.query.download === "1" ? "attachment" : "inline", media.filename));
+  response.setHeader("Accept-Ranges", "bytes");
+  response.setHeader("Cache-Control", "private, no-store");
+  if (object.ContentLength !== undefined) response.setHeader("Content-Length", object.ContentLength);
+  if (object.ETag) response.setHeader("ETag", object.ETag);
+  response.status(200).end();
+}));
+
+app.get("/api/media/:mediaId/content", rateLimit({ windowMs: 60_000, limit: 600, standardHeaders: "draft-7", legacyHeaders: false }), asyncRoute(async (request, response) => {
+  const media = await accessibleMedia(request, response);
+  if (!media) return;
+  const range = request.get("Range");
+  if (range && !/^bytes=\d*-\d*$/.test(range)) return response.status(416).end();
+  const object = await r2.send(new GetObjectCommand({ Bucket: env.R2_BUCKET, Key: media.objectKey, Range: range }));
+  if (!object.Body) return response.status(502).json({ error: "Media is unavailable" });
+  response.status(object.ContentRange ? 206 : 200);
+  response.setHeader("Content-Type", media.mimeType);
+  response.setHeader("Content-Disposition", mediaDisposition(request.query.download === "1" ? "attachment" : "inline", media.filename));
+  response.setHeader("Accept-Ranges", "bytes");
+  response.setHeader("Cache-Control", "private, no-store");
+  if (object.ContentLength !== undefined) response.setHeader("Content-Length", object.ContentLength);
+  if (object.ContentRange) response.setHeader("Content-Range", object.ContentRange);
+  if (object.ETag) response.setHeader("ETag", object.ETag);
+  await pipeline(object.Body as Readable, response);
 }));
 
 app.use((error: unknown, _request: Request, response: Response, _next: NextFunction) => {
@@ -293,6 +316,8 @@ app.use((error: unknown, _request: Request, response: Response, _next: NextFunct
 
 await mongoose.connect(env.MONGODB_URI, { maxPoolSize: 20, minPoolSize: 2, serverSelectionTimeoutMS: 5_000 });
 const httpServer = createServer(app);
+httpServer.requestTimeout = 60 * 60 * 1000;
+httpServer.headersTimeout = 60_000;
 const liveServer = new WebSocketServer({ noServer: true });
 httpServer.on("upgrade", (request, socket, head) => {
   const origin = request.headers.origin;

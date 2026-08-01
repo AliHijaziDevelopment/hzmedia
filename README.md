@@ -12,9 +12,9 @@ HZ Media is a multi-company media workspace. Super admins can create companies, 
 - Keycloak JWT verification against the realm JWKS endpoint
 - `super_admin` realm-role enforcement for company and member administration
 - MongoDB/Mongoose tenant models and indexed queries
-- Direct-to-Cloudflare-R2 uploads using short-lived signed URLs
+- Backend-streamed uploads to private Cloudflare R2
 - Non-blocking upload queue with per-file progress and live WebSocket status updates
-- Streamed album ZIP downloads without copying media onto the API server
+- Authenticated individual downloads streamed from R2 by the backend
 - MIME type and file-size validation, upload rate limits, security headers, restrictive CORS, and graceful database shutdown
 
 ## Local setup
@@ -52,13 +52,11 @@ The API stores only searchable metadata in MongoDB. Every image and video byte i
 
 Create an R2 bucket and an R2 API token with object read/write access limited to that bucket. Add its account ID, bucket name, access key ID, and secret access key to `.env`. Keep the bucket private.
 
-Uploads go directly from the browser to R2 using five-minute signed PUT URLs. After upload, the API verifies the object's size and media type before marking it ready. Album views receive fifteen-minute signed GET URLs, so the bucket never needs public access. The default maximum asset size is 500 MB.
+The browser sends each file only to the authenticated HZ Media API. The API validates the user, company, album, MIME type, and file size, then streams the request into R2 without holding the entire file in memory. The browser never receives an R2 hostname, credential, or signed URL. The default maximum asset size is 500 MB.
 
-The album closes as soon as files are submitted, so the user can continue working while the progress tray stays visible. Two files upload concurrently to keep the interface responsive. Album downloads are streamed from R2 into a ZIP response and are limited to the classic ZIP format's 4 GB archive size.
+The album closes as soon as files are submitted, so the user can continue working while the progress tray stays visible. Two files upload concurrently to keep the interface responsive. Images and videos are served through a protected backend endpoint, including byte-range support for video playback. Each media card downloads its original file and extension through that same endpoint.
 
-Add an R2 CORS policy allowing the website origin to use `PUT` and `GET` with the `Content-Type` header. For local development, the allowed origin is `http://localhost:3000`.
-
-The upload and download flows use standard WebSocket, XMLHttpRequest progress events, and normal HTTP streaming. They work in current Safari, Chrome, Edge, and Firefox without browser-specific extensions.
+No R2 CORS policy is required because browsers never communicate with the bucket. Upload progress uses standard XMLHttpRequest events, live status uses WebSocket, and video delivery supports standard HTTP byte ranges for current Safari, Chrome, Edge, and Firefox.
 
 ## Checks
 
@@ -103,7 +101,7 @@ sudo systemctl reload nginx
 sudo certbot --nginx -d hzmedia.hij-azi.com --redirect
 ```
 
-The DNS `A` record for `hzmedia.hij-azi.com` must point to the Contabo server before running Certbot. The website is exposed locally on port `3001` and the API on port `4001` because ports `3000` and `4000` are already in use. Nginx sends `/api` and `/auth` to the backend, keeps album downloads streaming, sends `/live` through the WebSocket connection, and sends everything else to the website.
+The DNS `A` record for `hzmedia.hij-azi.com` must point to the Contabo server before running Certbot. The website is exposed locally on port `3001` and the API on port `4001` because ports `3000` and `4000` are already in use. Nginx sends `/api` and `/auth` to the backend, sends `/live` through the WebSocket connection, and sends everything else to the website. Its API location accepts files up to 512 MB and disables request buffering so uploads can stream through the backend into R2.
 
 To deploy a later GitHub update:
 

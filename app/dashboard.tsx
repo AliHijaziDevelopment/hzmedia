@@ -6,7 +6,7 @@ import { useAuth } from "./auth-provider";
 type Me = { id: string; email: string; name: string; role: "super_admin" | "user"; companyIds: string[] };
 type Company = { _id: string; name: string; slug: string; memberCount: number; albumCount: number; storageBytes: number; createdAt: string };
 type Album = { _id: string; companyId: string; name: string; itemCount: number; createdAt: string; updatedAt: string };
-type Media = { _id: string; filename: string; mimeType: string; kind: "image" | "video"; bytes: number; url: string };
+type Media = { _id: string; filename: string; mimeType: string; kind: "image" | "video"; bytes: number; url: string; downloadUrl: string };
 type WorkspaceUser = { _id: string; username: string; firstName: string; lastName: string; email: string; name: string; companyIds: string[]; status: string; createdAt: string };
 type Modal = "company" | "album" | "addUser" | "assignUser" | null;
 type NavItem = "Overview" | "Companies" | "Members" | "Activity";
@@ -155,17 +155,6 @@ export default function Dashboard() {
     setUploads((current) => current.map((item) => item.id === task.id ? task : item));
     if (liveSocket.current?.readyState === WebSocket.OPEN) liveSocket.current.send(JSON.stringify({ type: "upload:progress", uploadId: task.id, filename: task.filename, progress: task.progress, status: task.status }));
   }
-  function downloadAlbum(album: Album) {
-    const link = document.createElement("a");
-    link.href = `${auth.apiBaseUrl}/api/albums/${album._id}/download`;
-    link.download = `${album.name}.zip`;
-    link.rel = "noopener";
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    flash("Download started");
-  }
-
   async function createCompany(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     try { const data = new FormData(event.currentTarget); await api("/api/companies", { method: "POST", body: JSON.stringify({ name: data.get("name") }) }); setModal(null); await refresh(); flash("Company created"); }
@@ -198,7 +187,16 @@ export default function Dashboard() {
   }
 
   async function showAlbum(album: Album) {
-    try { setOpenAlbum(album); setMedia([]); const result = await api<{ media: Media[] }>(`/api/albums/${album._id}/media`); setMedia(result.media); }
+    try {
+      setOpenAlbum(album);
+      setMedia([]);
+      const result = await api<{ media: Media[] }>(`/api/albums/${album._id}/media`);
+      setMedia(result.media.map((item) => ({
+        ...item,
+        url: new URL(item.url, auth.apiBaseUrl).toString(),
+        downloadUrl: new URL(item.downloadUrl, auth.apiBaseUrl).toString(),
+      })));
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : "Could not open album"); }
   }
 
@@ -220,14 +218,19 @@ export default function Dashboard() {
         try {
           if (!file.type.startsWith("image/") && !file.type.startsWith("video/")) throw new Error("Only images and videos are supported");
           publishUpload(task);
-          const created = await api<{ mediaId: string; uploadUrl: string }>(`/api/albums/${album._id}/uploads`, { method: "POST", body: JSON.stringify({ filename: file.name, mimeType: file.type, bytes: file.size }) });
+          const apiUploadUrl = new URL(`/api/albums/${album._id}/uploads`, auth.apiBaseUrl);
+          apiUploadUrl.searchParams.set("filename", file.name);
+          apiUploadUrl.searchParams.set("mimeType", file.type);
+          apiUploadUrl.searchParams.set("bytes", String(file.size));
+          apiUploadUrl.searchParams.set("uploadId", task.id);
           let lastProgress = 0;
-          await putFile(created.uploadUrl, file, (value) => {
+          await putFile(apiUploadUrl.toString(), file, (value) => {
             const progress = Math.min(95, Math.max(1, Math.round(value * 0.95)));
-            if (progress >= lastProgress + 2 || progress === 95) { lastProgress = progress; publishUpload({ ...task, progress, status: "uploading" }); }
+            if (progress >= lastProgress + 2 || progress === 95) {
+              lastProgress = progress;
+              publishUpload({ ...task, progress: value === 100 ? 98 : progress, status: value === 100 ? "processing" : "uploading" });
+            }
           });
-          publishUpload({ ...task, progress: 98, status: "processing" });
-          await api(`/api/media/${created.mediaId}/complete`, { method: "POST", body: JSON.stringify({ uploadId: task.id }) });
           publishUpload({ ...task, progress: 100, status: "complete" });
         } catch (reason) {
           const message = reason instanceof Error ? reason.message : "Upload failed";
@@ -270,7 +273,7 @@ export default function Dashboard() {
           {activeNav === "Overview" && <>
             <section className="stats-grid"><Stat label="Companies" value={companies.length} icon="⌂" tone="companies-icon" /><Stat label="Memberships" value={memberCount} icon="♙" tone="members-icon" /><Stat label="Albums" value={albumCount} icon="▱" tone="albums-icon" /><Stat label="Storage" value={formatBytes(storageBytes)} icon="◫" tone="assets-icon" /></section>
             <section className="recent-section"><SectionHeading title={selectedCompanyRecord ? `${selectedCompanyRecord.name} albums` : "Recent albums"} detail={`${visibleAlbums.length} album${visibleAlbums.length === 1 ? "" : "s"}`} action={<button className="text-button" onClick={() => navigate("Companies")}>View companies <span>→</span></button>} />
-              <AlbumCollection albums={visibleAlbums.slice(0, 5)} companies={companies} onOpen={showAlbum} onDownload={downloadAlbum} onNew={() => setModal("album")} canCreate={!!companies.length} emptyMessage={companies.length ? "Create the first album for this company." : me?.role === "super_admin" ? "Create a company to begin." : "Ask a super admin to assign you to a company."} />
+              <AlbumCollection albums={visibleAlbums.slice(0, 5)} companies={companies} onOpen={showAlbum} onNew={() => setModal("album")} canCreate={!!companies.length} emptyMessage={companies.length ? "Create the first album for this company." : me?.role === "super_admin" ? "Create a company to begin." : "Ask a super admin to assign you to a company."} />
             </section>
             {!!companies.length && <section className="companies-section"><SectionHeading title="Company snapshot" detail={`${companies.length} compan${companies.length === 1 ? "y" : "ies"}`} action={<button className="text-button" onClick={() => navigate("Companies")}>Manage companies <span>→</span></button>} /><CompanyRows companies={companies.slice(0, 4)} onSelect={chooseCompany} /></section>}
           </>}
@@ -279,7 +282,7 @@ export default function Dashboard() {
             {selectedCompanyRecord ? <>
               <div className="company-focus"><span className="company-logo blue">{companyInitials(selectedCompanyRecord.name)}</span><div><b>{selectedCompanyRecord.name}</b></div><Metric label="Members" value={selectedCompanyRecord.memberCount} /><Metric label="Albums" value={selectedCompanyRecord.albumCount} /><Metric label="Storage" value={formatBytes(selectedCompanyRecord.storageBytes)} /></div>
               <SectionHeading title="Company albums" detail={`${visibleAlbums.length} album${visibleAlbums.length === 1 ? "" : "s"}`} action={<button className="text-button" onClick={() => chooseCompany("all")}>View all companies <span>→</span></button>} />
-              <AlbumCollection albums={visibleAlbums} companies={companies} onOpen={showAlbum} onDownload={downloadAlbum} onNew={() => setModal("album")} canCreate emptyMessage="Create the first album for this company." />
+              <AlbumCollection albums={visibleAlbums} companies={companies} onOpen={showAlbum} onNew={() => setModal("album")} canCreate emptyMessage="Create the first album for this company." />
             </> : <>
               <SectionHeading title="All companies" detail={`${visibleCompanies.length} compan${visibleCompanies.length === 1 ? "y" : "ies"}`} />
               {visibleCompanies.length ? <CompanyRows companies={visibleCompanies} onSelect={chooseCompany} /> : <EmptyState icon="⌂" title={companies.length ? "No matching companies" : "No companies yet"} detail={companies.length ? "Try another search." : me?.role === "super_admin" ? "Create the first company." : "Ask a super admin to assign you to a company."} action={me?.role === "super_admin" && !companies.length ? <button className="primary-action" onClick={() => setModal("company")}>Create company</button> : undefined} />}
@@ -301,7 +304,7 @@ export default function Dashboard() {
 
     {modal && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setModal(null); }}><div className={`modal ${modal === "addUser" ? "wide-modal" : ""}`} role="dialog" aria-modal="true"><button className="modal-close" onClick={() => setModal(null)} aria-label="Close">×</button>{modal === "company" && <ActionForm title="Create company" onSubmit={createCompany}><label>Company name<input name="name" required autoFocus placeholder="Atlas Creative" /></label></ActionForm>}{modal === "album" && <ActionForm title="Create album" detail="Choose a company." onSubmit={createAlbum}><label>Album name<input name="name" required autoFocus placeholder="Autumn campaign" /></label><CompanySelect companies={companies} selectedId={selectedCompany} /></ActionForm>}{modal === "addUser" && <ActionForm title="Add user" onSubmit={createUser}><div className="field-row"><label>First name<input name="firstName" required autoFocus autoComplete="off" /></label><label>Last name<input name="lastName" required autoComplete="off" /></label></div><label>Username<input name="username" required minLength={3} autoComplete="off" placeholder="maya.ortiz" /></label><label>Email<input name="email" type="email" required autoComplete="off" placeholder="maya@company.com" /></label><label>Password<input name="password" type="password" required minLength={8} maxLength={128} autoComplete="new-password" /><small className="field-help">Minimum 8 characters.</small></label></ActionForm>}{modal === "assignUser" && <ActionForm title="Assign user" detail="A user can belong to multiple companies." onSubmit={assignUser}><UserSelect users={users} selectedId={assigningUserId} /><CompanySelect companies={companies} selectedId={selectedCompany} /></ActionForm>}</div></div>}
 
-    {openAlbum && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setOpenAlbum(null); }}><div className="media-modal" role="dialog" aria-modal="true"><div className="media-modal-head"><div><p>Album</p><h2>{openAlbum.name}</h2><small>{media.length} files</small></div><div><button className="download-button" onClick={() => downloadAlbum(openAlbum)}>↓ Download</button><label className={`upload-button ${uploading ? "disabled" : ""}`}>{uploading ? "Uploading…" : "＋ Upload media"}<input type="file" multiple accept="image/*,video/*" disabled={uploading} onChange={(event) => uploadFiles(event.target.files)} /></label><button className="modal-close static" onClick={() => setOpenAlbum(null)} aria-label="Close album">×</button></div></div>{media.length ? <div className="media-grid">{media.map((item) => <figure key={item._id}>{item.kind === "image" ? <img src={item.url} alt={item.filename} /> : <video src={item.url} controls preload="metadata" />}<figcaption><b>{item.filename}</b><small>{formatBytes(item.bytes)}</small></figcaption></figure>)}</div> : <div className="empty-state media-empty"><span>◫</span><h3>This album is empty</h3><p>Upload images or videos.</p></div>}</div></div>}
+    {openAlbum && <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setOpenAlbum(null); }}><div className="media-modal" role="dialog" aria-modal="true"><div className="media-modal-head"><div><p>Album</p><h2>{openAlbum.name}</h2><small>{media.length} files</small></div><div><label className={`upload-button ${uploading ? "disabled" : ""}`}>{uploading ? "Uploading…" : "＋ Upload media"}<input type="file" multiple accept="image/*,video/*" disabled={uploading} onChange={(event) => uploadFiles(event.target.files)} /></label><button className="modal-close static" onClick={() => setOpenAlbum(null)} aria-label="Close album">×</button></div></div>{media.length ? <div className="media-grid">{media.map((item) => <figure key={item._id}>{item.kind === "image" ? <img src={item.url} alt={item.filename} /> : <video src={item.url} controls preload="metadata" />}<figcaption><span><b>{item.filename}</b><small>{formatBytes(item.bytes)}</small></span><a className="media-download" href={item.downloadUrl} download={item.filename} onClick={() => flash("Download started")} aria-label={`Download ${item.filename}`}>↓ Download</a></figcaption></figure>)}</div> : <div className="empty-state media-empty"><span>◫</span><h3>This album is empty</h3><p>Upload images or videos.</p></div>}</div></div>}
     {!!uploads.length && <UploadTray uploads={uploads} onClear={() => setUploads((current) => current.filter((item) => item.status !== "complete" && item.status !== "error"))} />}
     {toast && <div className="toast"><span>✓</span>{toast}</div>}
   </main>;
@@ -312,9 +315,9 @@ function SectionHeading({ title, detail, action }: { title: string; detail: stri
 function Metric({ label, value }: { label: string; value: string | number }) { return <span className="metric"><small>{label}</small><b>{value}</b></span>; }
 function EmptyState({ icon, title, detail, action }: { icon: string; title: string; detail: string; action?: React.ReactNode }) { return <div className="empty-state"><span>{icon}</span><h3>{title}</h3><p>{detail}</p>{action}</div>; }
 function CompanyRows({ companies, onSelect }: { companies: Company[]; onSelect: (companyId: string) => void }) { return <div className="company-rows">{companies.map((company) => <button className="company-row" key={company._id} onClick={() => onSelect(company._id)}><span className="company-logo blue">{companyInitials(company.name)}</span><span className="company-main"><b>{company.name}</b><small>{company.memberCount} member{company.memberCount === 1 ? "" : "s"}</small></span><span><b>{company.albumCount}</b><small>Albums</small></span><span><b>{formatBytes(company.storageBytes)}</b><small>Storage</small></span><span className="row-arrow">→</span></button>)}</div>; }
-function AlbumCollection({ albums, companies, onOpen, onDownload, onNew, canCreate, emptyMessage }: { albums: Album[]; companies: Company[]; onOpen: (album: Album) => void; onDownload: (album: Album) => void; onNew: () => void; canCreate: boolean; emptyMessage: string }) {
+function AlbumCollection({ albums, companies, onOpen, onNew, canCreate, emptyMessage }: { albums: Album[]; companies: Company[]; onOpen: (album: Album) => void; onNew: () => void; canCreate: boolean; emptyMessage: string }) {
   if (!albums.length) return <EmptyState icon="▱" title="No albums here yet" detail={emptyMessage} action={canCreate ? <button className="primary-action" onClick={onNew}>Create album</button> : undefined} />;
-  return <div className="album-grid">{albums.map((album) => <article className="album-card" key={album._id} tabIndex={0} role="button" onClick={() => onOpen(album)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onOpen(album); } }}><div className="album-cover real-cover"><button className="album-download" aria-label={`Download ${album.name}`} onClick={(event) => { event.stopPropagation(); onDownload(album); }} onKeyDown={(event) => event.stopPropagation()}>↓</button><span className="album-initial">{companyInitials(album.name)}</span><span className="album-badge">{album.itemCount} items</span></div><div className="album-meta"><div><h3>{album.name}</h3><p>{companies.find((company) => company._id === album.companyId)?.name}</p></div><time>{formatDate(album.updatedAt)}</time></div></article>)}{canCreate && <button className="new-album-card" onClick={onNew}><span>＋</span><b>Create an album</b><small>Add images and videos</small></button>}</div>;
+  return <div className="album-grid">{albums.map((album) => <article className="album-card" key={album._id} tabIndex={0} role="button" onClick={() => onOpen(album)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onOpen(album); } }}><div className="album-cover real-cover"><span className="album-initial">{companyInitials(album.name)}</span><span className="album-badge">{album.itemCount} items</span></div><div className="album-meta"><div><h3>{album.name}</h3><p>{companies.find((company) => company._id === album.companyId)?.name}</p></div><time>{formatDate(album.updatedAt)}</time></div></article>)}{canCreate && <button className="new-album-card" onClick={onNew}><span>＋</span><b>Create an album</b><small>Add images and videos</small></button>}</div>;
 }
 function UploadTray({ uploads, onClear }: { uploads: UploadTask[]; onClear: () => void }) { const active = uploads.some((item) => item.status !== "complete" && item.status !== "error"); return <aside className="upload-tray" aria-live="polite"><div className="upload-tray-head"><div><b>{active ? "Uploading media" : "Uploads finished"}</b><small>{uploads.length} file{uploads.length === 1 ? "" : "s"}</small></div>{!active && <button onClick={onClear}>Clear</button>}</div><div className="upload-list">{uploads.map((item) => <div className={`upload-item ${item.status}`} key={item.id}><div className="upload-line"><b>{item.filename}</b><span>{uploadStatus(item)}</span></div><div className="upload-progress"><span style={{ width: `${item.progress}%` }} /></div></div>)}</div></aside>; }
 function UserRows({ users, companies, onAssign }: { users: WorkspaceUser[]; companies: Company[]; onAssign: (userId: string) => void }) { return <div className="user-rows">{users.map((user) => <div className="user-row" key={user._id}><span className="avatar">{companyInitials(user.name)}</span><span className="user-main"><b>{user.name}</b><small>@{user.username} · {user.email}</small><span className="company-chips">{user.companyIds.length ? user.companyIds.map((companyId) => <em key={companyId}>{companies.find((company) => company._id === companyId)?.name ?? "Company"}</em>) : <em className="unassigned">Not assigned</em>}</span></span><span><b>{user.companyIds.length}</b><small>Companies</small></span><button onClick={() => onAssign(user._id)}>Assign</button></div>)}</div>; }
@@ -331,11 +334,19 @@ function uploadStatus(item: UploadTask) { if (item.status === "complete") return
 function putFile(url: string, file: File, onProgress: (percent: number) => void) {
   return new Promise<void>((resolve, reject) => {
     const request = new XMLHttpRequest();
-    request.open("PUT", url, true);
+    request.open("POST", url, true);
+    request.withCredentials = true;
+    request.setRequestHeader("X-HZ-Media-Request", "1");
     request.setRequestHeader("Content-Type", file.type);
     request.upload.onprogress = (event) => { if (event.lengthComputable && event.total) onProgress(Math.round((event.loaded / event.total) * 100)); };
-    request.onload = () => request.status >= 200 && request.status < 300 ? resolve() : reject(new Error(`Upload failed for ${file.name}`));
-    request.onerror = () => reject(new Error(`Upload failed for ${file.name}`));
+    request.upload.onload = () => onProgress(100);
+    request.onload = () => {
+      if (request.status >= 200 && request.status < 300) { resolve(); return; }
+      let message = `Upload failed for ${file.name}`;
+      try { message = (JSON.parse(request.responseText) as { error?: string }).error ?? message; } catch { /* Use the fallback message. */ }
+      reject(new Error(message));
+    };
+    request.onerror = () => reject(new Error("Upload connection failed"));
     request.onabort = () => reject(new Error(`Upload cancelled for ${file.name}`));
     request.send(file);
   });
