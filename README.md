@@ -103,7 +103,7 @@ sudo systemctl reload nginx
 sudo certbot --nginx -d hzmedia.hij-azi.com --redirect
 ```
 
-The DNS `A` record for `hzmedia.hij-azi.com` must point to the Contabo server before running Certbot. The API is exposed locally on port `4001` because port `4000` is already in use. Nginx sends `/api` and `/auth` to that backend, keeps album downloads streaming, sends `/live` through the WebSocket connection, and sends everything else to the website.
+The DNS `A` record for `hzmedia.hij-azi.com` must point to the Contabo server before running Certbot. The website is exposed locally on port `3001` and the API on port `4001` because ports `3000` and `4000` are already in use. Nginx sends `/api` and `/auth` to the backend, keeps album downloads streaming, sends `/live` through the WebSocket connection, and sends everything else to the website.
 
 To deploy a later GitHub update:
 
